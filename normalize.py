@@ -37,6 +37,23 @@ def find_extraction_files(output_dir: Path):
     return sorted(files)
 
 
+def _preserve_reviewed(new_sheet, output_dir: Path):
+    existing_path = output_dir / f"page_{new_sheet.page_number:04}.normalized.json"
+    if not existing_path.exists():
+        return new_sheet
+
+    old_sheet = type(new_sheet).model_validate(json.loads(existing_path.read_text()))
+    old_rows_by_no = {r.row_no: r for r in old_sheet.rows}
+    merged_rows = [
+        old_rows_by_no[row.row_no] if row.row_no in old_rows_by_no and old_rows_by_no[row.row_no].reviewed else row
+        for row in new_sheet.rows
+    ]
+
+    if old_sheet.reviewed:
+        return old_sheet.model_copy(update={"rows": merged_rows})
+    return new_sheet.model_copy(update={"rows": merged_rows})
+
+
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -83,6 +100,7 @@ def main():
     household_sheets = [s for s in sheets if isinstance(s, NormalizedHouseholdFormSheet)]
 
     for sheet in sheets:
+        sheet = _preserve_reviewed(sheet, output_dir)
         out_path = output_dir / f"page_{sheet.page_number:04}.normalized.json"
         with open(out_path, "w") as f:
             json.dump(sheet.model_dump(), f, indent=2)

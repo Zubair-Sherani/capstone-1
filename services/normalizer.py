@@ -68,6 +68,9 @@ class NormalizedCensusRow(BaseModel):
     review_reasons: List[str] = []
     is_possible_duplicate: bool = False
     duplicate_of: Optional[DuplicateRef] = None
+    reviewed: bool = False
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 class NormalizedCensusSheet(BaseModel):
@@ -79,6 +82,9 @@ class NormalizedCensusSheet(BaseModel):
     rows: List[NormalizedCensusRow] = []
     needs_review: bool = False
     review_reasons: List[str] = []
+    reviewed: bool = False
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 class NormalizedHouseholdRow(BaseModel):
@@ -97,6 +103,9 @@ class NormalizedHouseholdRow(BaseModel):
     review_reasons: List[str] = []
     is_possible_duplicate: bool = False
     duplicate_of: Optional[DuplicateRef] = None
+    reviewed: bool = False
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 class NormalizedHouseholdFormSheet(BaseModel):
@@ -109,6 +118,9 @@ class NormalizedHouseholdFormSheet(BaseModel):
     rows: List[NormalizedHouseholdRow] = []
     needs_review: bool = False
     review_reasons: List[str] = []
+    reviewed: bool = False
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 def _expand_year(year_str: str) -> int:
