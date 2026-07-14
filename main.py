@@ -1,10 +1,15 @@
 import argparse
+import json
 import os
 
 import cv2
+from dotenv import load_dotenv
 
 from services.pdf_reader import PDFReader
 from services.image_preprocessor import ImagePreprocessor
+from services.document_extractor import DocumentExtractor, DocumentType
+
+load_dotenv()
 
 
 def parse_args():
@@ -21,6 +26,10 @@ def parse_args():
     parser.add_argument(
         "--output-dir", default="output", help="Directory to write processed pages to (default: output)"
     )
+    parser.add_argument(
+        "--extract", action="store_true",
+        help="Also run OCR extraction (Claude) on each page and write page_NNNN.json"
+    )
     return parser.parse_args()
 
 
@@ -32,6 +41,7 @@ def main():
 
     reader = PDFReader()
     preprocessor = ImagePreprocessor()
+    extractor = DocumentExtractor() if args.extract else None
 
     # Pages are loaded one at a time (via first_page/last_page) to avoid
     # running out of memory on large, multi-hundred-page scans.
@@ -42,6 +52,18 @@ def main():
         print("Processing page:", page_num)
         cleaned = preprocessor.preprocess(page)
         cv2.imwrite(f"{args.output_dir}/page_{page_num:04}.png", cleaned)
+
+        if extractor is not None:
+            print("Extracting page:", page_num)
+            doc_type, extraction = extractor.extract(cleaned)
+            if doc_type == DocumentType.UNKNOWN:
+                print(f"  WARNING: page {page_num} did not match a known layout — flagged UNKNOWN for manual review")
+            output = {
+                "document_type": doc_type.value,
+                "data": extraction.model_dump() if extraction is not None else None,
+            }
+            with open(f"{args.output_dir}/page_{page_num:04}.json", "w") as f:
+                json.dump(output, f, indent=2)
 
     print("Finished.")
 
