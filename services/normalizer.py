@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 from pydantic import BaseModel
 
-from services.document_extractor import CensusRow, CensusSheetExtraction
+from services.document_extractor import CensusRow, CensusSheetExtraction, HouseholdRow, HouseholdFormExtraction
 
 MONTH_NAMES = {
     "jan": 1, "january": 1,
@@ -48,6 +48,7 @@ class DuplicateRef(BaseModel):
     source_file: str
     page_number: int
     row_no: int
+    document_type: str
 
 
 class NormalizedSmearResult(BaseModel):
@@ -76,6 +77,36 @@ class NormalizedCensusSheet(BaseModel):
     sector: Optional[str] = None
     block: Optional[str] = None
     rows: List[NormalizedCensusRow] = []
+    needs_review: bool = False
+    review_reasons: List[str] = []
+
+
+class NormalizedHouseholdRow(BaseModel):
+    row_no: int
+    name: str
+    status: NormalizedValue
+    stated_age: Optional[int] = None
+    stated_age_unit: NormalizedValue
+    sex: NormalizedValue
+    occupation: Optional[str] = None
+    symptoms: NormalizedValue
+    date_smear_taken: NormalizedValue
+    result_of_smear: NormalizedValue
+    date_treated: NormalizedValue
+    needs_review: bool = False
+    review_reasons: List[str] = []
+    is_possible_duplicate: bool = False
+    duplicate_of: Optional[DuplicateRef] = None
+
+
+class NormalizedHouseholdFormSheet(BaseModel):
+    source_file: str
+    page_number: int
+    card_no: Optional[str] = None
+    house_number: Optional[str] = None
+    block_number: Optional[str] = None
+    date_surveyed: NormalizedValue
+    rows: List[NormalizedHouseholdRow] = []
     needs_review: bool = False
     review_reasons: List[str] = []
 
@@ -147,6 +178,23 @@ def normalize_smear_result(raw: Optional[str]) -> Tuple[str, Optional[str]]:
     if text.lstrip().startswith("+"):
         return "POSITIVE", None
     return "UNKNOWN", f"smear_result_unrecognized: raw='{raw}'"
+
+
+def normalize_age_unit(raw: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if raw is None:
+        return None, None
+    text = raw.strip().upper()
+    if text in ("YEARS", "MONTHS"):
+        return text, None
+    return None, f"age_unit_unrecognized: raw='{raw}'"
+
+
+def normalize_symptoms(raw: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if raw is None or not raw.strip():
+        return None, None
+    if raw.strip().lower() == "none":
+        return "NONE", None
+    return "PRESENT", None
 
 
 def _normalize_row(row: CensusRow) -> NormalizedCensusRow:
@@ -235,6 +283,108 @@ def normalize_sheet(
         date_censused=NormalizedValue(raw=extraction.date_censused, value=date_value),
         sector=extraction.sector,
         block=extraction.block,
+        rows=rows,
+        needs_review=needs_review,
+        review_reasons=reasons,
+    )
+
+
+def _normalize_household_row(row: HouseholdRow) -> NormalizedHouseholdRow:
+    reasons: List[str] = []
+
+    if not row.name or not row.name.strip():
+        reasons.append("missing_name")
+    if row.status is None:
+        reasons.append("missing_status")
+    if row.stated_age is None:
+        reasons.append("missing_stated_age")
+    if row.sex is None:
+        reasons.append("missing_sex")
+
+    status_value, status_reason = normalize_status(row.status)
+    if status_reason:
+        reasons.append(status_reason)
+
+    sex_value, sex_reason = normalize_sex(row.sex)
+    if sex_reason:
+        reasons.append(sex_reason)
+
+    age_unit_value, age_unit_reason = normalize_age_unit(row.stated_age_unit)
+    if age_unit_reason:
+        reasons.append(age_unit_reason)
+    if row.stated_age is not None and row.stated_age_unit is None:
+        reasons.append("missing_stated_age_unit")
+
+    symptoms_value, _ = normalize_symptoms(row.symptoms)
+
+    date_value, date_reason = normalize_date(row.date_smear_taken)
+    if row.date_smear_taken is not None and date_reason:
+        reasons.append(f"date_smear_taken_unparseable: raw='{row.date_smear_taken}'")
+
+    result_value, _ = normalize_smear_result(row.result_of_smear)
+    if row.result_of_smear is not None and result_value == "UNKNOWN":
+        reasons.append(f"smear_result_unrecognized: raw='{row.result_of_smear}'")
+
+    if row.date_smear_taken is not None and row.result_of_smear is None:
+        reasons.append("smear_taken_missing_result")
+    elif row.date_smear_taken is None and row.result_of_smear is not None:
+        reasons.append("smear_result_missing_date")
+
+    treated_value, treated_reason = normalize_date(row.date_treated)
+    if row.date_treated is not None and treated_reason:
+        reasons.append(f"date_treated_unparseable: raw='{row.date_treated}'")
+    if row.date_treated is not None and row.date_smear_taken is None and row.result_of_smear is None:
+        reasons.append("date_treated_without_smear_record")
+
+    return NormalizedHouseholdRow(
+        row_no=row.row_no,
+        name=row.name,
+        status=NormalizedValue(raw=row.status, value=status_value),
+        stated_age=row.stated_age,
+        stated_age_unit=NormalizedValue(raw=row.stated_age_unit, value=age_unit_value),
+        sex=NormalizedValue(raw=row.sex, value=sex_value),
+        occupation=row.occupation,
+        symptoms=NormalizedValue(raw=row.symptoms, value=symptoms_value),
+        date_smear_taken=NormalizedValue(raw=row.date_smear_taken, value=date_value),
+        result_of_smear=NormalizedValue(raw=row.result_of_smear, value=result_value),
+        date_treated=NormalizedValue(raw=row.date_treated, value=treated_value),
+        needs_review=len(reasons) > 0,
+        review_reasons=reasons,
+    )
+
+
+def normalize_household_form(
+    extraction: HouseholdFormExtraction, source_file: str, page_number: int
+) -> NormalizedHouseholdFormSheet:
+    reasons: List[str] = []
+
+    date_value, date_reason = normalize_date(extraction.header.date_surveyed)
+    if extraction.header.date_surveyed is not None and date_reason:
+        reasons.append(f"date_surveyed_unparseable: raw='{extraction.header.date_surveyed}'")
+
+    if extraction.header.house_number is None:
+        reasons.append("missing_household_identifier")
+    if not extraction.rows:
+        reasons.append("no_rows_extracted")
+
+    rows = [_normalize_household_row(row) for row in extraction.rows]
+
+    seen_row_nos = set()
+    for row in rows:
+        if row.row_no in seen_row_nos:
+            row.review_reasons.append("duplicate_row_no")
+            row.needs_review = True
+        seen_row_nos.add(row.row_no)
+
+    needs_review = len(reasons) > 0 or any(row.needs_review for row in rows)
+
+    return NormalizedHouseholdFormSheet(
+        source_file=source_file,
+        page_number=page_number,
+        card_no=extraction.header.card_no,
+        house_number=extraction.header.house_number,
+        block_number=extraction.header.block_number,
+        date_surveyed=NormalizedValue(raw=extraction.header.date_surveyed, value=date_value),
         rows=rows,
         needs_review=needs_review,
         review_reasons=reasons,

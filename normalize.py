@@ -4,8 +4,13 @@ import re
 from pathlib import Path
 
 from services.dedup import find_duplicates
-from services.document_extractor import CensusSheetExtraction
-from services.normalizer import normalize_sheet
+from services.document_extractor import CensusSheetExtraction, HouseholdFormExtraction
+from services.normalizer import (
+    normalize_sheet,
+    normalize_household_form,
+    NormalizedCensusSheet,
+    NormalizedHouseholdFormSheet,
+)
 
 PAGE_FILE_RE = re.compile(r"^page_(\d{4})\.json$")
 
@@ -54,33 +59,42 @@ def main():
                 f"extraction on this page with the current main.py before normalizing."
             )
 
-        if wrapper["document_type"] != "CENSUS_SHEET":
-            print(f"Skipping {path.name}: document_type={wrapper['document_type']!r} not yet handled by normalize.py")
+        doc_type = wrapper["document_type"]
+        if doc_type == "CENSUS_SHEET":
+            extraction = CensusSheetExtraction.model_validate(wrapper["data"])
+            sheets.append(normalize_sheet(extraction, source_file=args.source_file, page_number=page_number))
+        elif doc_type == "HOUSEHOLD_FORM":
+            household_extraction = HouseholdFormExtraction.model_validate(wrapper["data"])
+            sheets.append(
+                normalize_household_form(household_extraction, source_file=args.source_file, page_number=page_number)
+            )
+        else:
+            print(f"Skipping {path.name}: document_type={doc_type!r} not yet handled by normalize.py")
             skipped += 1
             continue
 
-        extraction = CensusSheetExtraction.model_validate(wrapper["data"])
-        sheets.append(normalize_sheet(extraction, source_file=args.source_file, page_number=page_number))
-
     if not sheets:
-        print(f"No CENSUS_SHEET pages to normalize ({skipped} skipped).")
+        print(f"No recognized pages to normalize ({skipped} skipped).")
         return
 
     find_duplicates(sheets)
 
-    review_count = 0
-    duplicate_count = 0
+    census_sheets = [s for s in sheets if isinstance(s, NormalizedCensusSheet)]
+    household_sheets = [s for s in sheets if isinstance(s, NormalizedHouseholdFormSheet)]
+
     for sheet in sheets:
         out_path = output_dir / f"page_{sheet.page_number:04}.normalized.json"
         with open(out_path, "w") as f:
             json.dump(sheet.model_dump(), f, indent=2)
-        if sheet.needs_review:
-            review_count += 1
-        duplicate_count += sum(1 for row in sheet.rows if row.is_possible_duplicate)
+
+    census_review = sum(1 for s in census_sheets if s.needs_review)
+    household_review = sum(1 for s in household_sheets if s.needs_review)
+    duplicate_count = sum(1 for s in sheets for row in s.rows if row.is_possible_duplicate)
 
     print(
-        f"Normalized {len(sheets)} sheet(s) ({skipped} skipped). "
-        f"{review_count} need review. {duplicate_count} possible duplicate row(s)."
+        f"Normalized {len(census_sheets)} census sheet(s), {len(household_sheets)} household form(s) "
+        f"({skipped} skipped). {census_review} census / {household_review} household need review. "
+        f"{duplicate_count} possible duplicate row(s)."
     )
 
 
