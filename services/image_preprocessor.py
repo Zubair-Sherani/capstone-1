@@ -31,7 +31,9 @@ class ImagePreprocessor:
         if angle < -45:
             angle = 90 + angle
 
-        if abs(angle) < 0.3:
+        # Only correct small skews; large angles mean the page is intentionally
+        # landscape/rotated, not just slightly tilted during scanning.
+        if abs(angle) < 0.3 or abs(angle) > 5:
             return image
 
         h, w = image.shape[:2]

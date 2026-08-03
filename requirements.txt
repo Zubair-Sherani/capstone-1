@@ -1,5 +1,12 @@
+anthropic
 opencv-python==5.0.0.93
+paddleocr
+paddlepaddle
 pdf2image==1.17.0
+Pillow
 pip-chill==1.0.5
 psycopg2-binary==2.9.12
 python-dotenv==1.2.2
+sentencepiece
+torch
+transformers==4.46.3
