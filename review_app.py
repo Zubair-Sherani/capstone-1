@@ -1,7 +1,10 @@
+import json
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+import psycopg2
 import streamlit as st
 
 from services.dedup import NormalizedSheet
@@ -12,8 +15,11 @@ from services.normalizer import (
     NormalizedValue,
 )
 from services.review_io import discover_pages, load_sheet, save_sheet
+from services.sql_sync import DB_NAME, sync_sheet
 
 OUTPUT_DIR = Path("output")
+
+PAGE_FILE_RE = re.compile(r"^page_(\d{4})\.json$")
 
 STATUS_OPTIONS = ["", "HEAD", "WIFE", "HUSBAND", "SON", "DAUGHTER", "GUEST", "OTHER"]
 SEX_OPTIONS = ["", "M", "F"]
@@ -50,71 +56,170 @@ def _validate_int(value: str) -> Optional[str]:
     return None
 
 
+@st.cache_resource
+def _get_db_connection():
+    return psycopg2.connect(dbname=DB_NAME)
+
+
+def _persist_sheet(sheet: NormalizedSheet, output_dir: Path) -> None:
+    # JSON is the source of truth for the review workflow; the SQL sync is
+    # best-effort so a Postgres hiccup never blocks saving a review.
+    save_sheet(sheet, output_dir)
+    try:
+        sync_sheet(sheet, _get_db_connection())
+    except Exception as e:
+        _get_db_connection.clear()
+        st.warning(f"Saved locally, but couldn't sync to the SQL database: {e}")
+
+
 def _sheet_resolved(sheet: NormalizedSheet) -> bool:
     if sheet.needs_review and not sheet.reviewed:
         return False
     return all(not (row.needs_review and not row.reviewed) for row in sheet.rows)
 
 
-def render_sidebar(page_numbers: List[int]) -> Optional[int]:
+def _discover_all_page_numbers(output_dir: Path) -> List[int]:
+    numbers = []
+    for path in output_dir.iterdir():
+        if path.name.endswith(".normalized.json"):
+            continue
+        match = PAGE_FILE_RE.match(path.name)
+        if match:
+            numbers.append(int(match.group(1)))
+    return sorted(numbers)
+
+
+@st.cache_data(show_spinner=False)
+def _page_summary(page_number: int, mtime: float, output_dir_str: str) -> dict:
+    # `mtime` is only used as a cache key so an edited/saved page is the one
+    # whose summary gets recomputed, instead of re-reading all pages from
+    # disk on every rerun (Streamlit reruns the whole script on any widget
+    # interaction, and this output dir holds 500+ pages).
+    sheet = load_sheet(page_number, Path(output_dir_str))
+    doc_type = "CENSUS_SHEET" if isinstance(sheet, NormalizedCensusSheet) else "HOUSEHOLD_FORM"
+    flagged_rows = [row for row in sheet.rows if row.needs_review]
+    unreviewed_rows = [row for row in flagged_rows if not row.reviewed]
+    return {
+        "page_number": page_number,
+        "doc_type": doc_type,
+        "flagged": len(flagged_rows),
+        "unreviewed": len(unreviewed_rows),
+        "resolved": _sheet_resolved(sheet),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _unclassified_summary(page_number: int, mtime: float, output_dir_str: str) -> dict:
+    # Pages main.py flagged UNKNOWN (didn't match either known layout) never get a
+    # .normalized.json, so they're real pages with nothing else tracking them —
+    # give them a summary too instead of letting them silently disappear from the count.
+    path = Path(output_dir_str) / f"page_{page_number:04}.json"
+    data = json.loads(path.read_text())
+    reviewed = bool(data.get("reviewed", False))
+    return {
+        "page_number": page_number,
+        "doc_type": data.get("document_type", "UNKNOWN"),
+        "flagged": 1,
+        "unreviewed": 0 if reviewed else 1,
+        "resolved": reviewed,
+    }
+
+
+def render_sidebar(output_dir: Path) -> Optional[int]:
     st.sidebar.text_input("Reviewer name", key="reviewer_name")
-    show_flagged_only = st.sidebar.checkbox("Show only pages needing review", value=True)
+
+    classified_pages = discover_pages(output_dir)
+    classified_numbers = {page_number for page_number, _json_path, _normalized_path in classified_pages}
+    unclassified_numbers = [n for n in _discover_all_page_numbers(output_dir) if n not in classified_numbers]
+
+    summaries = [
+        _page_summary(page_number, normalized_path.stat().st_mtime, str(output_dir))
+        for page_number, _json_path, normalized_path in classified_pages
+    ]
+    summaries += [
+        _unclassified_summary(page_number, (output_dir / f"page_{page_number:04}.json").stat().st_mtime, str(output_dir))
+        for page_number in unclassified_numbers
+    ]
+
+    total = len(summaries)
+    resolved_total = sum(1 for s in summaries if s["resolved"])
+    flagged_total = sum(s["flagged"] for s in summaries)
+    census_total = sum(1 for s in summaries if s["doc_type"] == "CENSUS_SHEET")
+    household_total = sum(1 for s in summaries if s["doc_type"] == "HOUSEHOLD_FORM")
+    unclassified_total = total - census_total - household_total
+    st.sidebar.progress(
+        resolved_total / total if total else 0.0, text=f"{resolved_total}/{total} pages resolved"
+    )
     st.sidebar.caption(
-        "Note: review edits survive re-running normalize.py, but not re-extracting "
-        "a page whose row numbering has changed."
+        f"{census_total} census sheet(s) · {household_total} household form(s) · "
+        f"{unclassified_total} unclassified · {flagged_total} row(s)/page(s) flagged"
     )
 
-    summaries = []
-    for page_number in page_numbers:
-        sheet = load_sheet(page_number, OUTPUT_DIR)
-        doc_type = "CENSUS_SHEET" if isinstance(sheet, NormalizedCensusSheet) else "HOUSEHOLD_FORM"
-        flagged_rows = [row for row in sheet.rows if row.needs_review]
-        unreviewed_rows = [row for row in flagged_rows if not row.reviewed]
-        resolved = _sheet_resolved(sheet)
-        summaries.append(
-            {
-                "page_number": page_number,
-                "doc_type": doc_type,
-                "flagged": len(flagged_rows),
-                "unreviewed": len(unreviewed_rows),
-                "resolved": resolved,
-            }
-        )
+    show_flagged_only = st.sidebar.checkbox("Show only pages needing review", value=True)
+    doc_filter = st.sidebar.radio(
+        "Document type", ["All", "Census", "Household", "Unclassified"], horizontal=True
+    )
 
+    filtered = summaries
     if show_flagged_only:
-        summaries = [s for s in summaries if not s["resolved"]]
+        filtered = [s for s in filtered if not s["resolved"]]
+    if doc_filter == "Census":
+        filtered = [s for s in filtered if s["doc_type"] == "CENSUS_SHEET"]
+    elif doc_filter == "Household":
+        filtered = [s for s in filtered if s["doc_type"] == "HOUSEHOLD_FORM"]
+    elif doc_filter == "Unclassified":
+        filtered = [s for s in filtered if s["doc_type"] not in ("CENSUS_SHEET", "HOUSEHOLD_FORM")]
 
-    if not summaries:
-        st.sidebar.success("No pages need review.")
+    if not filtered:
+        st.sidebar.success("No pages match the current filters.")
         return None
 
-    summaries.sort(key=lambda s: (s["resolved"], s["page_number"]))
+    filtered.sort(key=lambda s: (s["resolved"], s["page_number"]))
 
-    labels = []
-    for s in summaries:
+    def _label(s: dict) -> str:
+        if s["doc_type"] not in ("CENSUS_SHEET", "HOUSEHOLD_FORM"):
+            icon = "🟢" if s["resolved"] else "🟣"
+            detail = "reviewed" if s["resolved"] else "unclassified — needs a look"
+            return f"{icon} p.{s['page_number']} · ?? · {detail}"
+        short_doc = "CS" if s["doc_type"] == "CENSUS_SHEET" else "HH"
         if s["resolved"]:
-            icon = "🟢"
-            detail = "clean" if s["flagged"] == 0 else "reviewed"
+            icon, detail = "🟢", ("clean" if s["flagged"] == 0 else "reviewed")
         elif s["unreviewed"] == s["flagged"]:
-            icon = "🔴"
-            detail = f"{s['flagged']} row(s) need review"
+            icon, detail = "🔴", f"{s['flagged']} flagged"
         else:
-            icon = "🟡"
-            detail = f"{s['flagged'] - s['unreviewed']}/{s['flagged']} flagged rows reviewed"
-        labels.append(f"{icon} Page {s['page_number']} — {s['doc_type']} — {detail}")
+            icon, detail = "🟡", f"{s['flagged'] - s['unreviewed']}/{s['flagged']} done"
+        return f"{icon} p.{s['page_number']} · {short_doc} · {detail}"
 
-    page_number_list = [s["page_number"] for s in summaries]
-    label_by_page_number = dict(zip(page_number_list, labels))
+    page_number_list = [s["page_number"] for s in filtered]
+    label_by_page_number = {s["page_number"]: _label(s) for s in filtered}
 
     if "page_radio_widget" not in st.session_state or st.session_state["page_radio_widget"] not in page_number_list:
         st.session_state["page_radio_widget"] = page_number_list[0]
 
-    return st.sidebar.radio(
-        "Select page",
+    current_index = page_number_list.index(st.session_state["page_radio_widget"])
+    col_prev, col_next = st.sidebar.columns(2)
+    with col_prev:
+        if st.button("◀ Prev", disabled=current_index == 0, width="stretch"):
+            st.session_state["page_radio_widget"] = page_number_list[current_index - 1]
+            st.rerun()
+    with col_next:
+        if st.button("Next ▶", disabled=current_index == len(page_number_list) - 1, width="stretch"):
+            st.session_state["page_radio_widget"] = page_number_list[current_index + 1]
+            st.rerun()
+
+    selected = st.sidebar.selectbox(
+        f"Page ({len(page_number_list)} shown — type to search)",
         options=page_number_list,
         format_func=lambda page_number: label_by_page_number[page_number],
         key="page_radio_widget",
     )
+
+    st.sidebar.caption(
+        "Review edits survive re-running normalize.py, but not re-extracting "
+        "a page whose row numbering has changed."
+    )
+
+    return selected
 
 
 def render_sheet_header(sheet: NormalizedSheet, output_dir: Path) -> None:
@@ -162,7 +267,7 @@ def render_sheet_header(sheet: NormalizedSheet, output_dir: Path) -> None:
     sheet.reviewed_by = reviewer_name
     sheet.reviewed_at = _now_iso()
 
-    save_sheet(sheet, output_dir)
+    _persist_sheet(sheet, output_dir)
     st.success("Header saved.")
     st.rerun()
 
@@ -315,7 +420,7 @@ def render_row_editor(sheet: NormalizedSheet, row, output_dir: Path) -> None:
         row.reviewed_by = reviewer_name
         row.reviewed_at = _now_iso()
 
-        save_sheet(sheet, output_dir)
+        _persist_sheet(sheet, output_dir)
         st.success(f"Row {row.row_no} saved.")
         st.rerun()
 
@@ -340,6 +445,37 @@ def render_page(sheet: NormalizedSheet, image_path: Path, output_dir: Path) -> N
             render_row_editor(sheet, row, output_dir)
 
 
+def render_unclassified_page(page_number: int, output_dir: Path) -> None:
+    reviewer_name = st.session_state.get("reviewer_name", "")
+    json_path = output_dir / f"page_{page_number:04}.json"
+    data = json.loads(json_path.read_text())
+
+    st.warning(
+        f"Page {page_number} didn't match either known form layout "
+        f"(document_type={data.get('document_type')!r}) — nothing was extracted from it. "
+        "Check the image below: confirm it's genuinely a blank/cover page, or flag it for "
+        "re-extraction if the layout should have matched."
+    )
+
+    image_path = output_dir / f"page_{page_number:04}.png"
+    if image_path.exists():
+        st.image(str(image_path), width="stretch")
+    else:
+        st.warning(f"Image not found: {image_path}")
+
+    reviewed = bool(data.get("reviewed", False))
+    if reviewed:
+        st.success(f"Marked reviewed by {data.get('reviewed_by') or '(unnamed)'} at {data.get('reviewed_at')}")
+
+    if st.button("Mark reviewed" if not reviewed else "Un-mark reviewed", key=f"unclassified_review_{page_number}"):
+        data["reviewed"] = not reviewed
+        data["reviewed_by"] = reviewer_name
+        data["reviewed_at"] = _now_iso()
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="Census / Household Form Review", layout="wide")
     st.title("Census / Household Form Review")
@@ -348,19 +484,21 @@ def main() -> None:
         st.error(f"Output directory {OUTPUT_DIR} does not exist.")
         return
 
-    pages = discover_pages(OUTPUT_DIR)
-    if not pages:
-        st.info("No normalized pages found. Run main.py --extract and normalize.py first.")
+    if not _discover_all_page_numbers(OUTPUT_DIR):
+        st.info("No extracted pages found. Run main.py --extract first.")
         return
 
-    page_numbers = [p[0] for p in pages]
-    selected_page = render_sidebar(page_numbers)
+    selected_page = render_sidebar(OUTPUT_DIR)
     if selected_page is None:
         return
 
-    sheet = load_sheet(selected_page, OUTPUT_DIR)
-    image_path = OUTPUT_DIR / f"page_{selected_page:04}.png"
-    render_page(sheet, image_path, OUTPUT_DIR)
+    normalized_path = OUTPUT_DIR / f"page_{selected_page:04}.normalized.json"
+    if normalized_path.exists():
+        sheet = load_sheet(selected_page, OUTPUT_DIR)
+        image_path = OUTPUT_DIR / f"page_{selected_page:04}.png"
+        render_page(sheet, image_path, OUTPUT_DIR)
+    else:
+        render_unclassified_page(selected_page, OUTPUT_DIR)
 
 
 if __name__ == "__main__":

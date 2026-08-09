@@ -1,5 +1,8 @@
 -- Target data model for extracted documents.
--- Source: handwritten Census Sheet and Clinic Summary Form ledgers.
+-- Source: handwritten Census Sheet and Household Form (Malaria Survey) ledgers.
+--
+-- Review/dedup columns mirror services/normalizer.py's NormalizedValue-wrapped
+-- fields and services/dedup.py's duplicate-detection output.
 
 -- ==========================================================
 -- Census Sheet
@@ -9,9 +12,15 @@ CREATE TABLE census_sheet (
     id             SERIAL PRIMARY KEY,
     source_file    TEXT NOT NULL,
     page_number    INT,
+    date_censused_raw  TEXT,
     date_censused  DATE,
     sector         TEXT,
     block          TEXT,
+    needs_review   BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons TEXT[] NOT NULL DEFAULT '{}',
+    reviewed       BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_by    TEXT,
+    reviewed_at    TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -20,44 +29,83 @@ CREATE TABLE census_row (
     census_sheet_id  INT NOT NULL REFERENCES census_sheet(id) ON DELETE CASCADE,
     row_no           INT NOT NULL,
     name             TEXT NOT NULL,
-    status           TEXT,   -- e.g. HEAD, WIFE, S (son), D (daughter)
+    status_raw       TEXT,
+    status           TEXT,   -- e.g. HEAD, WIFE, SON, DAUGHTER, GUEST, OTHER
     stated_age       INT,
+    sex_raw          TEXT,
     sex              CHAR(1),  -- M / F
-    occupation       TEXT
+    occupation       TEXT,
+    needs_review          BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons        TEXT[] NOT NULL DEFAULT '{}',
+    is_possible_duplicate BOOLEAN NOT NULL DEFAULT FALSE,
+    duplicate_of_source_file    TEXT,
+    duplicate_of_page_number    INT,
+    duplicate_of_row_no         INT,
+    duplicate_of_document_type  TEXT,
+    reviewed       BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_by    TEXT,
+    reviewed_at    TIMESTAMPTZ
 );
 
 CREATE TABLE census_smear_result (
     id             SERIAL PRIMARY KEY,
     census_row_id  INT NOT NULL REFERENCES census_row(id) ON DELETE CASCADE,
+    smear_date_raw TEXT,
     smear_date     DATE,
-    result         TEXT  -- '+' / '-'
+    result_raw     TEXT,
+    result         TEXT  -- POSITIVE / NEGATIVE / UNKNOWN
 );
 
 -- ==========================================================
--- Clinic Summary Form
+-- Household Form (Malaria Survey)
 -- ==========================================================
 
-CREATE TABLE clinic_report (
-    id           SERIAL PRIMARY KEY,
-    source_file  TEXT NOT NULL,
-    page_number  INT,
-    house_no     TEXT,
-    block_no     TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE clinic_row (
-    id                SERIAL PRIMARY KEY,
-    clinic_report_id  INT NOT NULL REFERENCES clinic_report(id) ON DELETE CASCADE,
-    row_no            INT NOT NULL,
-    name              TEXT NOT NULL,
-    age               INT,
-    sex               CHAR(1)  -- M / F
-);
-
-CREATE TABLE clinic_visit (
+CREATE TABLE household_form (
     id             SERIAL PRIMARY KEY,
-    clinic_row_id  INT NOT NULL REFERENCES clinic_row(id) ON DELETE CASCADE,
-    visit_date     DATE,
-    notes          TEXT  -- raw diagnosis/treatment text as written
+    source_file    TEXT NOT NULL,
+    page_number    INT,
+    card_no        TEXT,
+    house_number   TEXT,
+    block_number   TEXT,
+    date_surveyed_raw  TEXT,
+    date_surveyed  DATE,
+    needs_review   BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons TEXT[] NOT NULL DEFAULT '{}',
+    reviewed       BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_by    TEXT,
+    reviewed_at    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE household_row (
+    id                 SERIAL PRIMARY KEY,
+    household_form_id  INT NOT NULL REFERENCES household_form(id) ON DELETE CASCADE,
+    row_no             INT NOT NULL,
+    name               TEXT NOT NULL,
+    status_raw         TEXT,
+    status             TEXT,   -- e.g. HEAD, WIFE, SON, DAUGHTER, GUEST, OTHER
+    stated_age         INT,
+    stated_age_unit_raw TEXT,
+    stated_age_unit    TEXT,  -- YEARS / MONTHS
+    sex_raw            TEXT,
+    sex                CHAR(1),  -- M / F
+    occupation         TEXT,
+    symptoms_raw       TEXT,
+    symptoms           TEXT,  -- NONE / PRESENT
+    date_smear_taken_raw  TEXT,
+    date_smear_taken   DATE,
+    result_of_smear_raw   TEXT,
+    result_of_smear    TEXT,  -- POSITIVE / NEGATIVE / UNKNOWN
+    date_treated_raw   TEXT,
+    date_treated       DATE,
+    needs_review          BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons        TEXT[] NOT NULL DEFAULT '{}',
+    is_possible_duplicate BOOLEAN NOT NULL DEFAULT FALSE,
+    duplicate_of_source_file    TEXT,
+    duplicate_of_page_number    INT,
+    duplicate_of_row_no         INT,
+    duplicate_of_document_type  TEXT,
+    reviewed       BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_by    TEXT,
+    reviewed_at    TIMESTAMPTZ
 );
