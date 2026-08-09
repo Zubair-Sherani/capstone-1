@@ -93,7 +93,7 @@ def _sync_household_form(sheet: NormalizedHouseholdFormSheet, conn) -> None:
             INSERT INTO household_form
                 (source_file, page_number, card_no, house_number, block_number, date_surveyed_raw, date_surveyed,
                  needs_review, review_reasons, reviewed, reviewed_by, reviewed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
